@@ -22,8 +22,8 @@ services:
       - S3_DEFAULT_BUCKET=pypi
       - VALKEY_HOST=valkey
       - VALKEY_PORT=6379
-      - AUTH_AUTHORIZATION_URL=https://github.com/login/oauth/authorize
-      - AUTH_TOKEN_URL=https://github.com/login/oauth/access_token
+      - AUTH_AUTHORIZATION_URL=http://localhost:8000/auth
+      - AUTH_TOKEN_URL=http://localhost:8000/token
       - AUTH_JWT_SECRET_KEY=supersecretkey
       - AUTH_TOKEN_EXPIRE_MINUTES=60
     volumes:

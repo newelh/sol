@@ -263,18 +263,38 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             Client identifier
 
         """
-        # TODO: Extract user ID from authentication when available
+        # Extract user ID from authentication context if available
+        auth_user = None
+
+        # Check for the user object attached to the request state
+        if hasattr(request.state, "user") and request.state.user:
+            auth_user = request.state.user
+
+            # If we have a user ID, use it as the client identifier
+            if "user_id" in auth_user and auth_user["user_id"] != "anonymous":
+                user_id = auth_user["user_id"]
+                # Use a prefix to distinguish user IDs from IP hashes
+                return f"user:{user_id}"
+
+        # Try to extract API key from headers
+        api_key = request.headers.get("X-API-Key")
+        if api_key:
+            # Hash the API key to use as identifier
+            # This works even before authentication is complete
+            return f"apikey:{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
 
         # Try X-Forwarded-For header
         forwarded_for = request.headers.get("X-Forwarded-For")
         if forwarded_for:
             # Use the first IP in the list (client IP)
             client_ip = forwarded_for.split(",")[0].strip()
-            return hashlib.md5(client_ip.encode(), usedforsecurity=False).hexdigest()
+            return f"ip:{hashlib.md5(client_ip.encode(), usedforsecurity=False).hexdigest()}"
 
         # Use client host
         client_host = request.client.host if request.client else "unknown"
-        return hashlib.md5(client_host.encode(), usedforsecurity=False).hexdigest()
+        return (
+            f"ip:{hashlib.md5(client_host.encode(), usedforsecurity=False).hexdigest()}"
+        )
 
     def _get_token_cost(self, path: str) -> int:
         """

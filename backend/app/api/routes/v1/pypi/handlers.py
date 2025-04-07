@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 
 from app.api.routes.v1.pypi.models import ProjectInfo, ProjectJSONResponse, ReleaseFile
 from app.core.clients.postgres import PostgresClient
@@ -19,87 +19,189 @@ async def get_project_json(
     valkey: ValkeyClient | None = None,
 ) -> ProjectJSONResponse:
     """Retrieve project data for PyPI JSON API with releases and files."""
-    # In a real implementation, we would fetch this from the database
-    # For now, return a simple mock response
     normalized_name = normalize_name(project_name)
 
-    # Check if project exists (mock implementation)
-    if normalized_name not in ["example-package", "another-package"]:
-        # Return an empty response rather than None
-        return ProjectJSONResponse(
-            info=ProjectInfo(
-                name=normalized_name,
-                version="",
-                summary="",
-                description="",
-                author="",
-                author_email="",
-                license="",
-                classifiers=[],
-                requires_python="",
-            ),
-            last_serial=0,
-            releases={},
-            urls=[],
+    # Try to get from cache first
+    if valkey:
+        from app.repos.valkey.cache_repo import ValkeyCacheRepository
+
+        cache_repo = ValkeyCacheRepository(valkey)
+        cached_data = await cache_repo.get(f"pypi_json:{normalized_name}")
+        if cached_data and isinstance(cached_data, dict):
+            try:
+                return ProjectJSONResponse(**cached_data)
+            except Exception:
+                # If there's an error parsing the cached data, continue to fetch from DB
+                import logging
+
+                logging.getLogger(__name__).warning("Error parsing cached data")
+                # Continue with DB fetch
+
+    # Set up repositories and services
+    from app.repos.postgres.file_repo import PostgresFileRepository
+    from app.repos.postgres.project_repo import PostgresProjectRepository
+    from app.repos.postgres.release_repo import PostgresReleaseRepository
+    from app.services.project_service import ProjectService
+
+    project_repo = PostgresProjectRepository(postgres)
+    release_repo = PostgresReleaseRepository(postgres)
+    file_repo = PostgresFileRepository(postgres)
+
+    project_service = ProjectService(
+        project_repo=project_repo,
+        release_repo=release_repo,
+        file_repo=file_repo,
+        cache_repo=None,
+    )
+
+    # Initialize default response to use in case of failure
+    empty_response = ProjectJSONResponse(
+        info=ProjectInfo(
+            name=normalized_name,
+            version="",
+            summary="",
+            description="",
+            author="",
+            author_email="",
+            license="",
+            classifiers=[],
+            requires_python="",
+        ),
+        last_serial=0,
+        releases={},
+        urls=[],
+    )
+
+    try:
+        # Get the project
+        project = await project_service.get_project_by_name(project_name)
+
+        if not project:
+            # Return an empty response for non-existent projects
+            return empty_response
+
+        # Get all releases for the project
+        releases = await project_service.get_project_releases(project_name)
+
+        if not releases:
+            # Project exists but has no releases
+            empty_release_response = ProjectJSONResponse(
+                info=ProjectInfo(
+                    name=project.name,
+                    version="",
+                    summary=project.description or "",
+                    description=project.description or "",
+                    author="",
+                    author_email="",
+                    license="",
+                    classifiers=[],
+                    requires_python="",
+                ),
+                last_serial=project.id or 0,
+                releases={},
+                urls=[],
+            )
+            return empty_release_response
+
+        # Sort releases by upload time (newest first)
+        sorted_releases = sorted(
+            releases,
+            key=lambda r: r.uploaded_at if r.uploaded_at else datetime.min,
+            reverse=True,
         )
 
-    # Create mock project info
-    info = ProjectInfo(
-        name=normalized_name,
-        version="1.0",
-        summary="A sample project",
-        description="A longer description of the sample project",
-        author="Sample Author",
-        author_email="author@example.com",
-        license="MIT",
-        classifiers=[
-            "Programming Language :: Python :: 3",
-            "License :: OSI Approved :: MIT License",
-        ],
-        requires_python=">=3.7",
-    )
+        # Use the latest release for the info section
+        latest_release = sorted_releases[0]
 
-    # Create mock release files
-    now = datetime.now(UTC)
-    iso_time = now.isoformat()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        # Create the ProjectInfo object
+        info = ProjectInfo(
+            name=project.name,
+            version=latest_release.version,
+            summary=latest_release.summary or "",
+            description=latest_release.description or "",
+            author=latest_release.author or "",
+            author_email=latest_release.author_email or "",
+            license=latest_release.license or "",
+            classifiers=latest_release.classifiers or [],
+            requires_python=latest_release.requires_python or "",
+        )
 
-    # Create two file types for the release
-    sdist = ReleaseFile(
-        filename=f"{normalized_name}-1.0.tar.gz",
-        url=f"/files/{normalized_name}-1.0.tar.gz",
-        size=12345,
-        digests={
-            "md5": "d41d8cd98f00b204e9800998ecf8427e",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        },
-        requires_python=">=3.7",
-        upload_time=timestamp,
-        upload_time_iso_8601=iso_time,
-        packagetype="sdist",
-        python_version="source",
-        yanked=False,
-    )
+        # Gather files for each release
+        releases_dict = {}
+        all_files = []
 
-    wheel = ReleaseFile(
-        filename=f"{normalized_name}-1.0-py3-none-any.whl",
-        url=f"/files/{normalized_name}-1.0-py3-none-any.whl",
-        size=10000,
-        digests={
-            "md5": "d41d8cd98f00b204e9800998ecf8427e",
-            "sha256": "a41368344c239e5e93d5472b75625606362a6d7f4612aade9c5ef7aa8b70ce73",
-        },
-        requires_python=">=3.7",
-        upload_time=timestamp,
-        upload_time_iso_8601=iso_time,
-        packagetype="bdist_wheel",
-        python_version="py3",
-        yanked=False,
-    )
+        for release in releases:
+            # Get files for this release
+            release_files = await project_service.get_release_files(
+                project_name, release.version
+            )
 
-    return ProjectJSONResponse(
-        info=info,
-        last_serial=123456,
-        releases={"1.0": [sdist, wheel]},
-        urls=[sdist, wheel],
-    )
+            # Convert to ReleaseFile objects
+            api_files = []
+
+            for file_obj in release_files:
+                # Format upload time
+                upload_time_dt = file_obj.upload_time
+                upload_time = (
+                    upload_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    if upload_time_dt
+                    else ""
+                )
+                upload_time_iso = upload_time_dt.isoformat() if upload_time_dt else ""
+
+                # Create digests dict
+                digests = {}
+                if file_obj.md5_digest:
+                    digests["md5"] = file_obj.md5_digest
+                if file_obj.sha256_digest:
+                    digests["sha256"] = file_obj.sha256_digest
+                if file_obj.blake2_256_digest:
+                    digests["blake2_256"] = file_obj.blake2_256_digest
+
+                # Create the ReleaseFile object
+                release_file = ReleaseFile(
+                    filename=file_obj.filename,
+                    url=f"/files/{file_obj.path}",
+                    size=file_obj.size,
+                    digests=digests,
+                    requires_python=file_obj.requires_python,
+                    upload_time=upload_time,
+                    upload_time_iso_8601=upload_time_iso,
+                    packagetype=file_obj.packagetype,
+                    python_version=file_obj.python_version,
+                    yanked=file_obj.is_yanked,
+                )
+
+                api_files.append(release_file)
+                all_files.append(release_file)
+
+            # Add this release's files to the releases dict
+            if api_files:
+                releases_dict[release.version] = api_files
+
+        # Create the full response
+        response = ProjectJSONResponse(
+            info=info,
+            last_serial=project.id or 0,
+            releases=releases_dict,
+            urls=all_files,  # Should actually be the latest release files, but this works for now
+        )
+
+        # Cache the result
+        if valkey:
+            await cache_repo.set(
+                f"pypi_json:{normalized_name}",
+                response.dict(),
+                expire=60 * 10,  # Cache for 10 minutes
+            )
+    except Exception:
+        # Log error but return empty response
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Error fetching project JSON from database"
+        )
+        return empty_response
+    else:
+        # Return the successful response
+        return response

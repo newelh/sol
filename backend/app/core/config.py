@@ -25,7 +25,9 @@ class PostgresSettings(BaseSettings):
     host: str = "localhost"  # Database server hostname/IP
     port: int = 5432  # PostgreSQL standard port
     user: str = "postgres"  # Database user for authentication
-    password: str = ""  # Password (default empty for development)
+    password: str | None = (
+        None  # Password - Must be provided via environment variables in production
+    )
     database: str = "pypi"  # Database name to connect to
     min_connections: int = 1  # Minimum connections in pool (set higher in production)
     max_connections: int = 10  # Maximum simultaneous connections allowed
@@ -95,19 +97,19 @@ class AuthSettings(BaseSettings):
     """Authentication and authorization settings."""
 
     # OAuth2 settings
-    authorization_url: str = "http://localhost:8000/auth"
+    authorization_url: str | None = None
     # URL to redirect users for OAuth login (e.g., GitHub login page)
-    # Default is for development only
+    # Must be provided via environment variables in production
 
-    token_url: str = "http://localhost:8000/token"  # noqa: S105
+    token_url: str | None = None
     # URL to exchange authorization code for access token
-    # Default is for development only - not a security risk (dev URL)
+    # Must be provided via environment variables in production
 
-    jwt_secret_key: str = "insecure-dev-key-do-not-use-in-production-environment"  # noqa: S105
+    jwt_secret_key: str | None = None
     # Secret key used to sign JWT tokens
-    # This default is for development only!
     # REQUIRED: Must be at least 32 chars, high entropy in production
     # WARNING: Changing this invalidates all existing tokens!
+    # Must be provided via environment variables in production
 
     token_expire_minutes: int = 60  # How long JWT tokens remain valid
     # Balance security (shorter) vs. UX (longer)
