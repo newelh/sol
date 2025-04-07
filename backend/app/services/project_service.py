@@ -57,7 +57,10 @@ class ProjectService:
         self.cache_repo = cache_repo
 
     async def get_all_projects(self) -> list[Project]:
-        """Get all projects in the repository."""
+        """Get all projects in the repository.
+
+        Note: This method doesn't require release_repo or file_repo.
+        """
         # Try to get from cache first
         if self.cache_repo:
             cached = await self.cache_repo.get("all_projects")

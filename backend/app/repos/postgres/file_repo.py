@@ -166,6 +166,9 @@ class PostgresFileRepository(FileRepository):
             json.dumps(file.requires_external) if file.requires_external else "[]"
         )
         project_urls_json = json.dumps(file.project_urls) if file.project_urls else "{}"
+        download_stats_json = (
+            json.dumps(file.download_stats) if file.download_stats else "{}"
+        )
 
         query = """
         UPDATE files
@@ -203,7 +206,10 @@ class PostgresFileRepository(FileRepository):
             provides_dist = $33,
             obsoletes_dist = $34,
             requires_external = $35,
-            project_urls = $36
+            project_urls = $36,
+            download_count = $37,
+            last_download = $38,
+            download_stats = $39
         WHERE id = $1 AND release_id = $2
         RETURNING
             id, release_id, filename, size, md5_digest, sha256_digest,
@@ -214,7 +220,7 @@ class PostgresFileRepository(FileRepository):
             author, author_email, maintainer, maintainer_email, license,
             keywords, classifiers, platform, home_page, download_url,
             requires_dist, provides_dist, obsoletes_dist, requires_external,
-            project_urls
+            project_urls, download_count, last_download, download_stats
         """
         row = await self.postgres.fetchrow(
             query,
@@ -254,6 +260,9 @@ class PostgresFileRepository(FileRepository):
             obsoletes_dist_json,
             requires_external_json,
             project_urls_json,
+            file.download_count,
+            file.last_download,
+            download_stats_json,
         )
         return self._row_to_file(row)
 
@@ -285,6 +294,36 @@ class PostgresFileRepository(FileRepository):
         """
         result = await self.postgres.execute(query, file_id)
         return "UPDATE 1" in result
+
+    async def update_download_stats(self, file_id: int, increment_by: int = 1) -> bool:
+        """
+        Update download statistics for a file.
+
+        Args:
+            file_id: ID of the file to update
+            increment_by: Amount to increment the download count by
+
+        Returns:
+            True if successful, False otherwise
+        """
+        query = """
+        UPDATE files
+        SET
+            download_count = download_count + $2,
+            last_download = NOW()
+        WHERE id = $1
+        """
+        try:
+            result = await self.postgres.execute(query, file_id, increment_by)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                f"Error incrementing download count for file {file_id}"
+            )
+            return False
+        else:
+            return "UPDATE 1" in result
 
     def _row_to_file(self, row: dict[str, Any] | None) -> File:
         """Transform database row into File domain object with JSON field parsing."""
@@ -323,6 +362,9 @@ class PostgresFileRepository(FileRepository):
         obsoletes_dist = parse_json_list(row.get("obsoletes_dist"))
         requires_external = parse_json_list(row.get("requires_external"))
         project_urls = parse_json_dict(row.get("project_urls"))
+
+        # Handle download statistics
+        download_stats = parse_json_dict(row.get("download_stats"))
 
         return File(
             id=row["id"],
@@ -363,4 +405,8 @@ class PostgresFileRepository(FileRepository):
             obsoletes_dist=obsoletes_dist,
             requires_external=requires_external,
             project_urls=project_urls,
+            # Add download statistics
+            download_count=row.get("download_count", 0),
+            last_download=row.get("last_download"),
+            download_stats=download_stats,
         )

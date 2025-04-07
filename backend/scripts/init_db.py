@@ -30,15 +30,24 @@ async def create_tables(conn: asyncpg.Connection) -> None:
     );
     """)
 
+    # Update API keys table with new fields for secure key storage
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS api_keys (
         id SERIAL PRIMARY KEY,
-        key TEXT NOT NULL,
+        key TEXT, -- Legacy field, will be phased out
+        key_id TEXT, -- Public identifier of the key (first part of the key)
+        key_hash TEXT, -- Secure hash of the full key
+        key_salt TEXT, -- Salt used for hashing
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         scopes JSONB DEFAULT '["download"]'::JSONB,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        last_used_at TIMESTAMP WITH TIME ZONE,
         expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-        UNIQUE(key)
+        revoked BOOLEAN DEFAULT FALSE,
+        revoked_at TIMESTAMP WITH TIME ZONE,
+        description TEXT,
+        UNIQUE(key) -- For backward compatibility
     );
     """)
 
@@ -139,6 +148,10 @@ async def create_tables(conn: asyncpg.Connection) -> None:
         obsoletes_dist JSONB DEFAULT '[]'::JSONB,
         requires_external JSONB DEFAULT '[]'::JSONB,
         project_urls JSONB DEFAULT '{}'::JSONB,
+        -- Download statistics fields
+        download_count INTEGER DEFAULT 0,
+        last_download TIMESTAMP WITH TIME ZONE,
+        download_stats JSONB DEFAULT '{}'::JSONB,
         UNIQUE(release_id, filename)
     );
     """)
@@ -220,22 +233,114 @@ async def create_test_user(conn: asyncpg.Connection) -> None:
 
                 expires_at = datetime.utcnow() + timedelta(days=365)
 
+                # Create hash and salt for secure storage
+                import hashlib
+                import os
+
+                salt = os.urandom(16)
+                salt_hex = salt.hex()
+
+                # Hash the key
+                key_hash = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    b"testpassword",
+                    salt,
+                    100000,  # 100k iterations for security
+                )
+                key_hash_hex = key_hash.hex()
+
+                # Insert with both old key field (for compatibility) and new secure fields
                 await conn.execute(
                     """
                     INSERT INTO api_keys (
-                        key, user_id, scopes, expires_at
+                        key, key_id, key_hash, key_salt, user_id, scopes,
+                        expires_at, description, last_used_at
                     ) VALUES (
-                        'testpassword', $1, '["download", "upload"]', $2
+                        'testpassword', 'test', $1, $2, $3, '["download", "upload"]',
+                        $4, 'Test API key for integration testing', NOW()
                     )
                     """,
+                    key_hash_hex,
+                    salt_hex,
                     user_id,
                     expires_at,
                 )
-                logging.info("Test API key created successfully.")
+                logging.info("Test API key created successfully with secure storage.")
             else:
                 logging.info("Test API key already exists.")
     except Exception:
         logging.exception("Error creating test user or API key")
+
+
+async def migrate_api_keys(conn: asyncpg.Connection) -> None:
+    """Migrate existing API keys to the new secure schema."""
+    try:
+        # First check if we have the key_id column
+        key_id_exists = False
+        try:
+            await conn.fetchval(
+                """
+                SELECT key_id FROM api_keys LIMIT 1
+                """
+            )
+            key_id_exists = True
+        except asyncpg.exceptions.UndefinedColumnError:
+            key_id_exists = False
+
+        # If the key_id column doesn't exist, skip the migration
+        if not key_id_exists:
+            logging.info(
+                "Schema needs migration, but skipping as it will run next time"
+            )
+            return
+
+        # Get a list of API keys that haven't been migrated yet
+        # These will have key value but no key_hash
+        rows = await conn.fetch(
+            """
+            SELECT id, key FROM api_keys
+            WHERE key IS NOT NULL AND key_hash IS NULL
+            """
+        )
+
+        if not rows:
+            logging.info("No API keys need migration")
+            return
+
+        logging.info(f"Migrating {len(rows)} API keys to the new secure schema...")
+
+        for row in rows:
+            key_id = f"legacy_{row['id']}"
+
+            # Create a hash of the key
+            import hashlib
+            import os
+
+            salt = os.urandom(16)
+            key_hash = hashlib.pbkdf2_hmac(
+                "sha256",
+                row["key"].encode(),
+                salt,
+                100000,  # Use 100,000 iterations for PBKDF2
+            )
+
+            # Store the hash and salt
+            await conn.execute(
+                """
+                UPDATE api_keys
+                SET key_id = $1, key_hash = $2, key_salt = $3, updated_at = NOW()
+                WHERE id = $4
+                """,
+                key_id,
+                key_hash.hex(),
+                salt.hex(),
+                row["id"],
+            )
+
+        logging.info(f"Successfully migrated {len(rows)} API keys")
+
+    except Exception:
+        logging.exception("Error migrating API keys")
 
 
 async def main() -> None:
@@ -260,6 +365,10 @@ async def main() -> None:
         # Create tables
         logger.info("Creating database tables...")
         await create_tables(conn)
+
+        # Migrate API keys to new schema if needed
+        logger.info("Checking for API key migration...")
+        await migrate_api_keys(conn)
 
         # Create test user
         logger.info("Creating test user...")

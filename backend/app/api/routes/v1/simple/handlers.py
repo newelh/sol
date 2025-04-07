@@ -11,8 +11,18 @@ from app.api.routes.v1.simple.models import (
 from app.core.clients.postgres import PostgresClient
 from app.core.clients.s3 import S3Client
 from app.core.clients.valkey import ValkeyClient
+from app.domain.models import File
+from app.repos.postgres.file_repo import PostgresFileRepository
+from app.repos.postgres.project_repo import PostgresProjectRepository
+from app.repos.postgres.release_repo import PostgresReleaseRepository
+from app.repos.valkey.cache_repo import ValkeyCacheRepository
+from app.services.project_service import ProjectService
 
 logger = logging.getLogger(__name__)
+
+# Constants
+CACHE_EXPIRY_SHORT = 60 * 5  # 5 minutes
+CACHE_EXPIRY_LONG = 60 * 10  # 10 minutes
 
 
 def normalize_name(name: str) -> str:
@@ -25,18 +35,60 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _get_cache_repo(valkey: ValkeyClient | None) -> ValkeyCacheRepository | None:
+    """Get a cache repository if valkey client is available."""
+    if not valkey:
+        return None
+    return ValkeyCacheRepository(valkey)
+
+
+def _create_project_service(postgres: PostgresClient) -> ProjectService:
+    """Create and initialize a ProjectService with repositories."""
+    project_repo = PostgresProjectRepository(postgres)
+    release_repo = PostgresReleaseRepository(postgres)
+    file_repo = PostgresFileRepository(postgres)
+
+    return ProjectService(
+        project_repo=project_repo,
+        release_repo=release_repo,
+        file_repo=file_repo,
+        cache_repo=None,  # We handle caching explicitly in handlers
+    )
+
+
 async def get_all_projects(
     postgres: PostgresClient, valkey: ValkeyClient | None = None
 ) -> ProjectList:
     """Get all projects for the root `/simple/` endpoint."""
-    # In a real implementation, we would fetch projects from the database
-    # For now, return a simple mock response
-    projects = [
-        ProjectReference(name="example-package"),
-        ProjectReference(name="another-package"),
-    ]
+    cache_repo = _get_cache_repo(valkey)
+    cache_key = "simple_all_projects"
 
-    return ProjectList(projects=projects)
+    # Try to get from cache first
+    if cache_repo:
+        cached_data = await cache_repo.get(cache_key)
+        if cached_data and isinstance(cached_data, list):
+            return ProjectList(projects=[ProjectReference(name=p) for p in cached_data])
+
+    # Initialize service
+    project_service = _create_project_service(postgres)
+
+    try:
+        # Fetch all projects
+        projects_db = await project_service.get_all_projects()
+        project_refs = [ProjectReference(name=project.name) for project in projects_db]
+
+        # Cache the result if we have projects and a cache
+        if cache_repo and project_refs:
+            await cache_repo.set(
+                cache_key,
+                [p.name for p in project_refs],
+                expire=CACHE_EXPIRY_SHORT,
+            )
+
+        return ProjectList(projects=project_refs)
+    except Exception:
+        logger.exception("Error fetching projects from database")
+        return ProjectList(projects=[])  # Empty list as fallback
 
 
 async def get_project_detail(
@@ -46,44 +98,122 @@ async def get_project_detail(
     valkey: ValkeyClient | None = None,
 ) -> ProjectDetail:
     """Get project details and files for the `/simple/{project_name}/` endpoint."""
-    # Normalize project name as per PEP 503
     normalized_name = normalize_name(project_name)
+    cache_repo = _get_cache_repo(valkey)
+    cache_key = f"simple_project:{normalized_name}"
 
-    # In a real implementation, we would fetch project details from the database
-    # and file information from S3
-    # For now, return a simple mock response
-    files = [
-        PackageFile(
-            filename=f"{normalized_name}-1.0.tar.gz",
-            url=f"/files/{normalized_name}-1.0.tar.gz",
-            hashes={"sha256": "abcdef123456"},
-            requires_python=">=3.7",
-            yanked="Had a vulnerability",
-            gpg_sig=True,
-            size=123456,
-        ),
-        PackageFile(
-            filename=f"{normalized_name}-1.0-py3-none-any.whl",
-            url=f"/files/{normalized_name}-1.0-py3-none-any.whl",
-            hashes={"sha256": "fedcba654321"},
-            requires_python=">=3.7",
-            core_metadata={"sha256": "987654321abc"},
-            provenance=f"https://example.com/files/{normalized_name}-1.0-py3-none-any.whl.provenance",
-            size=1337,
-        ),
-    ]
+    # Initialize empty response for error cases
+    empty_response = ProjectDetail(name=normalized_name, files=[], versions=[])
 
-    return ProjectDetail(name=normalized_name, files=files, versions=["1.0"])
+    # Try to get from cache first
+    if cache_repo:
+        cached_data = await cache_repo.get(cache_key)
+        if cached_data and isinstance(cached_data, dict) and "files" in cached_data:
+            return ProjectDetail(
+                name=cached_data.get("name", normalized_name),
+                files=[PackageFile(**f) for f in cached_data.get("files", [])],
+                versions=cached_data.get("versions", []),
+            )
+
+    # Initialize service
+    project_service = _create_project_service(postgres)
+
+    try:
+        # Get the project
+        project = await project_service.get_project_by_name(project_name)
+        if not project:
+            return empty_response
+
+        # Get all releases for the project
+        releases = await project_service.get_project_releases(project_name)
+        if not releases:
+            return empty_response
+
+        # Process releases and files
+        all_files: list[PackageFile] = []
+        versions: list[str] = []
+
+        for release in releases:
+            versions.append(release.version)
+            release_files = await project_service.get_release_files(
+                project_name, release.version
+            )
+
+            all_files.extend(
+                _convert_file_to_package_file(file_obj) for file_obj in release_files
+            )
+
+        # Create the response object
+        result = ProjectDetail(name=project.name, files=all_files, versions=versions)
+
+        # Cache the result
+        if cache_repo:
+            await cache_repo.set(
+                cache_key,
+                {
+                    "name": project.name,
+                    "files": [f.dict() for f in all_files],
+                    "versions": versions,
+                },
+                expire=CACHE_EXPIRY_SHORT,
+            )
+
+    except Exception:
+        logger.exception("Error fetching project details from database")
+        return empty_response
+    else:
+        return result
+
+
+def _convert_file_to_package_file(file_obj: File) -> PackageFile:
+    """Convert a domain File object to a PackageFile response model."""
+    package_file = PackageFile(
+        filename=file_obj.filename,
+        url=f"/files/{file_obj.path}",
+        hashes=file_obj.hashes,
+        requires_python=file_obj.requires_python,
+        size=file_obj.size,
+    )
+
+    # Add yanked info if applicable
+    if file_obj.is_yanked:
+        package_file.yanked = file_obj.yank_reason or True
+
+    # Add metadata SHA if available
+    if file_obj.has_metadata and file_obj.metadata_sha256:
+        package_file.core_metadata = {"sha256": file_obj.metadata_sha256}
+
+    # Add GPG signature info if available
+    if file_obj.has_signature:
+        package_file.gpg_sig = True
+
+    return package_file
 
 
 async def check_project_exists(
     project_name: str, postgres: PostgresClient, valkey: ValkeyClient | None = None
 ) -> bool:
     """Verify if a project exists before fetching its details."""
-    # In a real implementation, we would check the database
-    # For now, return True for the example packages
     normalized_name = normalize_name(project_name)
-    return normalized_name in ["example-package", "another-package"]
+    cache_repo = _get_cache_repo(valkey)
+    cache_key = f"project_exists:{normalized_name}"
+
+    # Try cache first
+    if cache_repo:
+        cached = await cache_repo.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+
+    # Check the database
+    project_repo = PostgresProjectRepository(postgres)
+    project = await project_repo.get_project_by_name(project_name)
+    result = project is not None
+
+    # Cache the result
+    if cache_repo:
+        await cache_repo.set(cache_key, result, expire=CACHE_EXPIRY_LONG)
+
+    return result
 
 
 def validate_provenance_url(url: str) -> bool:

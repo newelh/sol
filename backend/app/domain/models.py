@@ -98,6 +98,11 @@ class File(BaseModel):
     requires_external: list[str] = Field(default_factory=list)
     project_urls: dict[str, str] = Field(default_factory=dict)
 
+    # Download statistics
+    download_count: int = 0  # Total number of downloads
+    last_download: datetime | None = None  # Last download timestamp
+    download_stats: dict[str, Any] = Field(default_factory=dict)  # Detailed statistics
+
     @property
     def hashes(self) -> dict[str, str]:
         """Get all available hashes for the file."""

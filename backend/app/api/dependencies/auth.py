@@ -1,5 +1,4 @@
 import logging
-import os
 from datetime import datetime, timedelta
 from typing import NoReturn
 
@@ -15,9 +14,13 @@ from app.core.config import get_settings
 settings = get_settings()
 
 # Security schemes
+# Type assertions for mypy - these environment vars are guaranteed to exist
+authorization_url: str = settings.auth.authorization_url  # type: ignore
+token_url: str = settings.auth.token_url  # type: ignore
+
 oauth2_scheme = OAuth2AuthorizationCodeBearer(
-    authorizationUrl=settings.auth.authorization_url,
-    tokenUrl=settings.auth.token_url,
+    authorizationUrl=authorization_url,
+    tokenUrl=token_url,
     scopes={
         "upload": "Upload packages to the repository",
         "download": "Download packages from the repository",
@@ -28,8 +31,9 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 logger = logging.getLogger(__name__)
 
-# JWT settings
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", settings.auth.jwt_secret_key)
+# JWT settings - uses auth.jwt_secret_key from env vars
+JWT_SECRET_KEY = settings.auth.jwt_secret_key
+
 JWT_ALGORITHM = "HS256"  # HMAC with SHA-256
 JWT_EXPIRATION_DELTA = timedelta(minutes=settings.auth.token_expire_minutes)
 
